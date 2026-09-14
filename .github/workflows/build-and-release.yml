@@ -1,0 +1,307 @@
+name: Build & Release MeshCore SAR iOS IPA
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Upstream Tag, Branch, or Commit SHA (leave empty to build latest upstream main HEAD)'
+        required: false
+        type: string
+        default: ''
+      force_rebuild:
+        description: 'Force build & overwrite release even if it already exists'
+        required: false
+        type: boolean
+        default: false
+      is_prerelease:
+        description: 'Mark published release as Pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    name: Resolve Target & Check Existing
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      git_ref: ${{ steps.resolve.outputs.git_ref }}
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      app_version: ${{ steps.resolve.outputs.app_version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      release_title: ${{ steps.resolve.outputs.release_title }}
+      release_notes: ${{ steps.resolve.outputs.release_notes }}
+    steps:
+      - name: Resolve target and compare
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TARGET: ${{ inputs.target }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
+          IS_PRERELEASE: ${{ inputs.is_prerelease || 'false' }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_REPO="dz0ny/meshcore-sar"
+          CURRENT_REPO="${GITHUB_REPOSITORY}"
+
+          echo "🔍 Resolving build target for ${UPSTREAM_REPO}..."
+
+          TARGET_REF=""
+          TAG_NAME=""
+          COMMIT_SHA=""
+          SHORT_SHA=""
+          APP_VERSION=""
+          PRERELEASE="$IS_PRERELEASE"
+          RELEASE_TITLE=""
+          RELEASE_NOTES=""
+
+          if [ -n "$INPUT_TARGET" ]; then
+            TARGET_REF="$INPUT_TARGET"
+            echo "🎯 Manual target requested: $TARGET_REF"
+
+            UPSTREAM_REL=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$TARGET_REF" 2>/dev/null || true)
+            if [ -n "$UPSTREAM_REL" ]; then
+              TAG_NAME="$TARGET_REF"
+              RELEASE_TITLE=$(echo "$UPSTREAM_REL" | jq -r '.name // empty')
+              RELEASE_NOTES=$(echo "$UPSTREAM_REL" | jq -r '.body // empty')
+              COMMIT_SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$TARGET_REF" --jq .sha 2>/dev/null || true)
+            else
+              COMMIT_DATA=$(gh api "repos/$UPSTREAM_REPO/commits/$TARGET_REF" 2>/dev/null || true)
+              if [ -n "$COMMIT_DATA" ]; then
+                COMMIT_SHA=$(echo "$COMMIT_DATA" | jq -r '.sha')
+                SHORT_SHA="${COMMIT_SHA:0:8}"
+                TAG_NAME="nightly-${TARGET_REF}-${SHORT_SHA}"
+                PRERELEASE="true"
+                RELEASE_TITLE="MeshCore SAR (${TARGET_REF} - ${SHORT_SHA})"
+                RELEASE_NOTES=$(echo "$COMMIT_DATA" | jq -r '.commit.message // empty')
+              else
+                TAG_NAME="$TARGET_REF"
+                COMMIT_SHA="$TARGET_REF"
+              fi
+            fi
+          else
+            echo "🔍 Auto-detecting latest upstream release or commit..."
+            LATEST_REL=$(gh api "repos/$UPSTREAM_REPO/releases/latest" 2>/dev/null || true)
+            if [ -z "$LATEST_REL" ] || [ "$LATEST_REL" = "null" ]; then
+              LATEST_REL=$(gh api "repos/$UPSTREAM_REPO/releases" --jq '.[0]' 2>/dev/null || true)
+            fi
+
+            if [ -n "$LATEST_REL" ] && [ "$LATEST_REL" != "null" ]; then
+              TAG_NAME=$(echo "$LATEST_REL" | jq -r '.tag_name')
+              RELEASE_TITLE=$(echo "$LATEST_REL" | jq -r '.name // empty')
+              RELEASE_NOTES=$(echo "$LATEST_REL" | jq -r '.body // empty')
+              TARGET_REF="$TAG_NAME"
+              COMMIT_SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$TAG_NAME" --jq .sha 2>/dev/null || true)
+              echo "✅ Found upstream release tag: $TAG_NAME"
+            else
+              # Upstream has no GitHub releases yet — build from main HEAD
+              echo "ℹ️ No upstream releases found. Resolving main branch HEAD..."
+              MAIN_COMMIT=$(gh api "repos/$UPSTREAM_REPO/commits/main" 2>/dev/null)
+              COMMIT_SHA=$(echo "$MAIN_COMMIT" | jq -r '.sha')
+              SHORT_SHA="${COMMIT_SHA:0:8}"
+              TARGET_REF="main"
+
+              # Fetch pubspec.yaml version
+              PUBSPEC_RAW=$(gh api "repos/$UPSTREAM_REPO/contents/pubspec.yaml?ref=main" -H "Accept: application/vnd.github.v3.raw" 2>/dev/null || true)
+              RAW_VER=$(echo "$PUBSPEC_RAW" | grep '^version:' | awk '{print $2}' | cut -d'+' -f1 || true)
+              if [ -n "$RAW_VER" ]; then
+                APP_VERSION="$RAW_VER"
+                TAG_NAME="v${RAW_VER}-${SHORT_SHA}"
+              else
+                TAG_NAME="v0.1.0-${SHORT_SHA}"
+              fi
+
+              RELEASE_TITLE="MeshCore SAR ${APP_VERSION:-$SHORT_SHA}"
+              RELEASE_NOTES=$(echo "$MAIN_COMMIT" | jq -r '.commit.message // empty')
+              echo "✅ Resolved main HEAD: commit=$SHORT_SHA, tag=$TAG_NAME"
+            fi
+          fi
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            echo "❌ Failed to resolve valid upstream target tag."
+            exit 1
+          fi
+
+          if [ -z "$SHORT_SHA" ] && [ -n "$COMMIT_SHA" ]; then
+            SHORT_SHA="${COMMIT_SHA:0:8}"
+          fi
+
+          if [ -z "$APP_VERSION" ]; then
+            APP_VERSION="${TAG_NAME#v}"
+          fi
+          if [ -z "$RELEASE_TITLE" ]; then
+            RELEASE_TITLE="MeshCore SAR ${TAG_NAME}"
+          fi
+
+          echo "📌 Target: Tag=$TAG_NAME | Ref=$TARGET_REF | Commit=${SHORT_SHA:-unknown} | Version=$APP_VERSION"
+
+          EXISTS_IN_REPO="false"
+          if gh release view "$TAG_NAME" --repo "$CURRENT_REPO" >/dev/null 2>&1; then
+            EXISTS_IN_REPO="true"
+            echo "ℹ️ Release '$TAG_NAME' already exists in $CURRENT_REPO"
+          fi
+
+          if [ "$EXISTS_IN_REPO" = "true" ] && [ "$FORCE_REBUILD" != "true" ]; then
+            echo "✅ Release '$TAG_NAME' already published and force_rebuild is false. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🚀 Proceeding to build '$TAG_NAME'"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "git_ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "release_title=$RELEASE_TITLE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "release_notes<<EOF_NOTES"
+            echo "$RELEASE_NOTES"
+            echo "EOF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+  build-ipa:
+    name: Build Unsigned IPA
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout MeshCore SAR (${{ needs.check-upstream.outputs.git_ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: dz0ny/meshcore-sar
+          ref: ${{ needs.check-upstream.outputs.git_ref }}
+
+      - name: Accept Xcode License
+        run: sudo xcodebuild -license accept || true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Dependencies
+        run: |
+          flutter config --enable-ios
+          flutter pub get
+
+      - name: Build iOS Application
+        run: |
+          set -euo pipefail
+          echo "⚙️ Building iOS release without codesign..."
+          flutter build ios --release --no-codesign
+          echo "✅ Flutter build succeeded"
+
+      - name: Package Clean Unsigned IPA
+        env:
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${TAG#v}"
+          IPA_NAME="MeshCoreSAR-${VERSION}.ipa"
+
+          APP_PATH="build/ios/iphoneos/Runner.app"
+          if [ ! -d "$APP_PATH" ]; then
+            APP_PATH=$(find "$PWD/build" -name "Runner.app" -type d 2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "❌ Runner.app not found"
+            find "$PWD/build" -name "*.app" -type d 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Found application bundle: $APP_PATH"
+
+          # Strip code signatures for clean unsigned IPA
+          echo "🧹 Removing previous code signatures for sideloading compatibility..."
+          codesign --remove-signature "${APP_PATH}" 2>/dev/null || true
+          find "${APP_PATH}" \( -name "*.dylib" -o -name "*.framework" -o -name "*.appex" \) -print0 | \
+            while IFS= read -r -d '' f; do
+              codesign --remove-signature "$f" 2>/dev/null || true
+            done
+
+          mkdir -p Payload
+          cp -R "${APP_PATH}" Payload/
+          zip -q -r -y "${IPA_NAME}" Payload
+
+          ls -lh "${IPA_NAME}"
+          echo "🎉 Successfully created ${IPA_NAME}"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshcore-ipa
+          path: MeshCoreSAR-*.ipa
+          retention-days: 2
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [check-upstream, build-ipa]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: meshcore-ipa
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+          GIT_REF: ${{ needs.check-upstream.outputs.git_ref }}
+          COMMIT_SHA: ${{ needs.check-upstream.outputs.commit_sha }}
+          SHORT_SHA: ${{ needs.check-upstream.outputs.short_sha }}
+          APP_VERSION: ${{ needs.check-upstream.outputs.app_version }}
+          IS_PRERELEASE: ${{ needs.check-upstream.outputs.prerelease }}
+          RELEASE_TITLE: ${{ needs.check-upstream.outputs.release_title }}
+          UPSTREAM_NOTES: ${{ needs.check-upstream.outputs.release_notes }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_REPO="dz0ny/meshcore-sar"
+
+          echo "📝 Fetching release notes from upstream $UPSTREAM_REPO..."
+          UPSTREAM_RELEASE_DATA=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$TAG" 2>/dev/null || true)
+
+          RELEASE_TITLE="$TAG"
+          if [ -n "$UPSTREAM_RELEASE_DATA" ]; then
+            FETCHED_TITLE=$(echo "$UPSTREAM_RELEASE_DATA" | jq -r '.name // empty')
+            [ -n "$FETCHED_TITLE" ] && RELEASE_TITLE="$FETCHED_TITLE"
+            echo "$UPSTREAM_RELEASE_DATA" | jq -r '.body // ""' > release_notes.md
+          elif [ -n "$UPSTREAM_NOTES" ]; then
+            echo "$UPSTREAM_NOTES" > release_notes.md
+          else
+            touch release_notes.md
+          fi
+
+          echo "🚀 Publishing Release '$TAG'..."
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+
+          EXTRA_FLAGS=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            EXTRA_FLAGS+=("--prerelease")
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TITLE" \
+            --notes-file release_notes.md \
+            "${EXTRA_FLAGS[@]}" \
+            MeshCoreSAR-*.ipa
